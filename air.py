@@ -134,9 +134,10 @@ class MultiMNIST(Dataset):
 
 def fetch_dataloaders(args):
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.device.type is 'cuda' else {}
-    dataset = MultiMNIST(root=args.data_dir, training=True, mini_data_size=args.mini_data_size)
+    dataset = MultiMNIST(root=args.data_dir, training=True, mini_data_size=args.mini_data_size, max_digits=1)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, **kwargs)
-    dataset = MultiMNIST(root=args.data_dir, training=False if args.mini_data_size is None else True, mini_data_size=args.mini_data_size)
+    dataset = MultiMNIST(root=args.data_dir, training=False if args.mini_data_size is None else True, mini_data_size=args.mini_data_size,
+                         max_digits=1)
     test_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, **kwargs)
     return train_dataloader, test_dataloader
 
@@ -582,6 +583,8 @@ def train_and_evaluate(model, train_dataloader, test_dataloader, model_optimizer
 
 if __name__ == '__main__':
     args = parser.parse_args()
+
+    args.max_steps = 1
 
     # setup writer and output folders
     writer = SummaryWriter(log_dir = os.path.join(args.output_dir, time.strftime('%Y-%m-%d_%H-%M-%S', time.gmtime())) \
