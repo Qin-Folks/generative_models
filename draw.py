@@ -323,7 +323,7 @@ def train_and_evaluate(model, train_dataloader, test_dataloader, loss_fn, optimi
 
     for epoch in range(start_epoch, args.n_epochs):
         train_epoch(model, train_dataloader, loss_fn, optimizer, epoch, writer, args)
-#        evaluate(model, test_dataloader, loss_fn, writer, args, epoch)
+        evaluate(model, test_dataloader, loss_fn, writer, args, epoch)
 
         # snapshot at end of epoch
         if args.save_model:

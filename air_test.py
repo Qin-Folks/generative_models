@@ -21,6 +21,11 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import save_image, make_grid
 from tensorboardX import SummaryWriter
 
+import random
+from torchvision import datasets, transforms
+
+import utils.utils_nn as utils_nn
+from torchvision.datasets import VisionDataset
 
 parser = argparse.ArgumentParser()
 
@@ -35,7 +40,7 @@ parser.add_argument('--seed', type=int, default=2182019, help='Random seed to us
 parser.add_argument('--cuda', type=int, default=None, help='Which cuda device to use')
 parser.add_argument('--verbose', '-v', action='count', help='Verbose mode; send gradient stats to tensorboard.')
 # model params
-parser.add_argument('--image_dims', type=tuple, default=(1,50,50), help='Dimensions of a single datapoint (e.g. (1,50,50) for multi MNIST).')
+parser.add_argument('--image_dims', type=tuple, default=(1,64,64), help='Dimensions of a single datapoint (e.g. (1,50,50) for multi MNIST).')
 parser.add_argument('--z_what_size', type=int, default=50, help='Size of the z_what latent representation.')
 parser.add_argument('--z_where_size', type=int, default=3, help='Size of the z_where latent representation e.g. dim=3 for (s, tx, ty) affine parametrization.')
 parser.add_argument('--z_pres_size', type=int, default=1, help='Size of the z_pres latent representation, e.g. dim=1 for the probability of occurence of an object.')
@@ -62,84 +67,178 @@ parser.add_argument('--log_interval', type=int, default=100, help='Write loss an
 parser.add_argument('--eval_interval', type=int, default=10, help='Number of epochs to eval model and save checkpoint.')
 parser.add_argument('--mini_data_size', type=int, default=None, help='Train only on this number of datapoints.')
 
-max_digit_num = 2
+max_digit_num = 1
+loc_num = 2
+the_dig_to_use = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 # --------------------
 # Data
 # --------------------
 
-class MultiMNIST(Dataset):
-    def __init__(self, root, training=True, download=True, max_digits=2, canvas_size=50, seed=42, mini_data_size=None):
-        self.root = os.path.expanduser(root)
 
-        # check if multi mnist already compiled
-        self.multi_mnist_filename = 'multi_mnist_{}_{}_{}'.format(max_digits, canvas_size, seed)
+class MultiMNIST(VisionDataset):
+    """Data Handler that creates Bouncing MNIST dataset on the fly."""
 
-        if not self._check_processed_exists():
-            if self._check_raw_exists():
-                # process into pt file
-                data = np.load(os.path.join(self.root, 'raw', self.multi_mnist_filename + '.npz'))
-                train_data, train_labels, test_data, test_labels = [data[f] for f in data.files]
-                self._process_and_save(train_data, train_labels, test_data, test_labels)
-            else:
-                if not download:
-                    raise RuntimeError('Dataset not found. Use download=True to download it.')
+    def __init__(self, train, data_root, num_digits=2, image_size=64, channels=3, nxt_dig_prob=1.0, to_sort_label=False,
+                 dig_to_use=None, rand_dig_combine=True, split_dig_set=False):
+        path = data_root
+        self.num_digits = num_digits
+        self.image_size = image_size
+        self.step_length = 0.1
+        self.digit_size = 32
+        self.seed_is_set = False  # multi threaded loading
+        self.channels = channels
+        self.to_sort_label = to_sort_label
+        self.rand_dig_combine = rand_dig_combine
+        self.split_dig_set = split_dig_set
+
+        self.data = datasets.MNIST(
+            path,
+            train=train,
+            download=True,
+            transform=transforms.Compose(
+                [transforms.Resize(self.digit_size),
+                 transforms.ToTensor()]))
+
+        self.N = len(self.data)
+        self.nxt_dig_prob = nxt_dig_prob
+        self.dig_to_use = dig_to_use
+        self.idx_to_use = None
+
+        if self.dig_to_use is not None:
+            self.idx_to_use = []
+            an_idx = 0
+            for x in self.data:
+                if x[1] in self.dig_to_use:
+                    self.idx_to_use.append(an_idx)
+                an_idx += 1
+        else:
+            self.dig_to_use = list(range(10))
+
+        self.split_labels = []
+        self.split_label_sets = []
+        if self.split_dig_set:
+            assert len(self.dig_to_use) >= self.num_digits
+            split_unit = int(len(self.dig_to_use) / self.num_digits)
+            for i in range(self.num_digits):
+                if i == self.num_digits-1:
+                    a_label_set = list([self.dig_to_use[x] for x in list(range(i * split_unit, len(self.dig_to_use)))])
                 else:
-                    (train_data, train_labels), (test_data, test_labels) = multi_mnist(root, max_digits, canvas_size, seed)
-                    self._process_and_save(train_data, train_labels, test_data, test_labels)
-        else:
-            data = torch.load(os.path.join(self.root, 'processed', self.multi_mnist_filename + '.pt'))
-            self.train_data, self.train_labels, self.test_data, self.test_labels = \
-                    data['train_data'], data['train_labels'], data['test_data'], data['test_labels']
+                    a_label_set = list([self.dig_to_use[x] for x in list(range(i * split_unit, (i+1)*split_unit))])
+                a_contained_label_set = []
+                for a_idx, (_, a_label) in enumerate(self.data):
+                    if a_label in a_label_set:
+                        a_contained_label_set.append(a_idx)
+                self.split_label_sets.append(a_label_set)
+                self.split_labels.append(a_contained_label_set)
 
-        if training:
-            self.x, self.y = self.train_data, self.train_labels
-        else:
-            self.x, self.y = self.test_data, self.test_labels
-
-        if mini_data_size != None:
-            self.x = self.x[:mini_data_size]
-            self.y = self.y[:mini_data_size]
-
-    def __getitem__(self, idx):
-        return self.x[idx].unsqueeze(0), self.y[idx]
+    def set_seed(self, seed):
+        if not self.seed_is_set:
+            self.seed_is_set = True
+            np.random.seed(seed)
 
     def __len__(self):
-        return len(self.x)
+        # return int(self.N * 2 / (10 / self.num_digits))
+        return self.N * 2
 
-    def _check_processed_exists(self):
-        return os.path.exists(os.path.join(self.root, 'processed', self.multi_mnist_filename + '.pt'))
+    def __getitem__(self, index):
+        labels = []
+        self.set_seed(index)
+        image_size = self.image_size
+        x = np.zeros((self.channels,
+                      image_size,
+                      image_size),
+                     dtype=np.float32)
 
-    def _check_raw_exists(self):
-        return os.path.exists(os.path.join(self.root, 'raw', self.multi_mnist_filename + '.npz'))
+        has_digit = False
+        rand_idxes = []
+        existing_labels = []
+        dig_idx = 0
+        while dig_idx < self.num_digits:
+            if random.uniform(0, 1) < self.nxt_dig_prob or (not has_digit and dig_idx == (self.num_digits-1)):
+                has_digit = True
+                if len(self.dig_to_use) == 10:
+                    if self.split_dig_set:
+                        idx = np.random.randint(len(self.split_labels[dig_idx]))
+                        rand_idxes.append(idx)
+                    else:
+                        idx = np.random.randint(self.N)
+                        rand_idxes.append(idx)
+                else:
+                    if self.split_dig_set:
+                        idx = np.random.randint(len(self.split_labels[dig_idx]))
+                        to_append = self.split_labels[dig_idx][idx]
+                    else:
+                        idx = np.random.randint(len(self.idx_to_use))
+                        to_append = self.idx_to_use[idx]
 
-    def _make_label_tensor(self, label_arr):
-        out = torch.zeros(10)
-        for l in label_arr:
-            out[l] += 1
-        return out
+                    if self.rand_dig_combine:
+                        rand_idxes.append(to_append)
+                    else:
+                        if self.nxt_dig_prob > 0.99:
+                            assert len(self.dig_to_use) > 1
+                        if self.data[to_append][1] not in existing_labels:
+                            rand_idxes.append(to_append)
+                            existing_labels.append(self.data[to_append][1])
+                        else:
+                            continue
+            else:
+                rand_idxes.append('empty')
+            dig_idx += 1
 
-    def _process_and_save(self, train_data, train_labels, test_data, test_labels):
-        self.train_data = torch.from_numpy(train_data).float() / 255
-        self.train_labels = torch.stack([self._make_label_tensor(label) for label in train_labels])
-        self.test_data = torch.from_numpy(test_data).float() / 255
-        self.test_labels = torch.stack([self._make_label_tensor(label) for label in test_labels])
-        # check folder exists
-        if not os.path.exists(os.path.join(self.root, 'processed')):
-            os.makedirs(os.path.join(self.root, 'processed'))
-        with open(os.path.join(self.root, 'processed', self.multi_mnist_filename + '.pt'), 'wb') as f:
-            torch.save({'train_data': self.train_data,
-                        'train_labels': self.train_labels,
-                        'test_data': self.test_data,
-                        'test_labels': self.test_labels},
-                        f)
+        if self.to_sort_label:
+            rand_idx_label = []
+            for rand_idxes_idx in range(len(rand_idxes)):
+                a_rand_idx = rand_idxes[rand_idxes_idx]
+                if self.split_dig_set:
+                    rand_idx_label.append(self.data[a_rand_idx][1] if a_rand_idx != 'empty' else random.choice(self.split_label_sets[rand_idxes_idx]))
+                else:
+                    rand_idx_label.append(self.data[a_rand_idx][1] if a_rand_idx != 'empty' else random.choice(self.dig_to_use))
+
+            arg_sort_rand_idx_label = np.argsort(rand_idx_label)
+            rand_idxes = list([rand_idxes[i] for i in arg_sort_rand_idx_label])
+
+        for n in range(len(rand_idxes)):
+            cur_digit_idx = rand_idxes[n]
+            if cur_digit_idx == 'empty':
+                labels.append(-1)
+            else:
+                digit, dig_label = self.data[cur_digit_idx]
+                labels.append(dig_label)
+                img_qtr_sz = int(self.image_size/4)
+
+                if self.channels > 1:
+                    cc = n+1
+                else:
+                    cc = 0
+
+                if self.num_digits == 2:
+                    x[cc, img_qtr_sz:img_qtr_sz+self.digit_size, n*self.digit_size:(n+1)*self.digit_size] = \
+                        np.copy(digit.numpy())
+
+                elif self.num_digits == 3 or self.num_digits == 4:
+                    idx_i = int(n / 2)
+                    idx_j = n % 2
+                    x[cc, idx_i*self.digit_size:(idx_i+1)*self.digit_size,
+                        idx_j*self.digit_size:(idx_j+1)*self.digit_size] = np.copy(digit.numpy())
+
+        # pick on digit to be in front
+        if self.channels > 1:
+            front = np.random.randint(self.num_digits)
+            for cc in range(self.num_digits):
+                if cc != front:
+                    x[cc, :, :][x[front, :, :] > 0] = 0
+        return x, torch.tensor(labels)
 
 def fetch_dataloaders(args):
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.device.type is 'cuda' else {}
-    dataset = MultiMNIST(root=args.data_dir, training=True, mini_data_size=args.mini_data_size, max_digits=max_digit_num)
+    dataset = MultiMNIST(train=True, data_root='data', image_size=64, num_digits=2, channels=1,
+                         to_sort_label=False, dig_to_use=the_dig_to_use, nxt_dig_prob=0.5,
+                         rand_dig_combine=False, split_dig_set=False)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, **kwargs)
-    dataset = MultiMNIST(root=args.data_dir, training=False if args.mini_data_size is None else True, mini_data_size=args.mini_data_size,
-                         max_digits=max_digit_num)
+    dataset = MultiMNIST(train=False, data_root='data', image_size=64, num_digits=2, channels=1,
+                         to_sort_label=True, dig_to_use=the_dig_to_use, nxt_dig_prob=0.5,
+                         rand_dig_combine=False, split_dig_set=False)
     test_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=True, **kwargs)
     return train_dataloader, test_dataloader
 
@@ -248,8 +347,8 @@ class AIR(nn.Module):
         # z_pres  ~ Ber(p) Geom(rho) discrete representation for the presence of a scene object
         # z_where ~ N(mu, scale); continuous 3-dim variable for pose (position and scale)
         # z_what  ~ N(0,1); continuous representation for shape
-        self.register_buffer('z_pres_prior', torch.tensor(args.z_pres_prior_success_prob))  # prior used for generation
-        self.register_buffer('z_pres_prob', torch.tensor(args.z_pres_anneal_start_value))   # `current value` used for training and annealing
+        # self.register_buffer('z_pres_prior', torch.tensor(args.z_pres_prior_success_prob))  # prior used for generation
+        # self.register_buffer('z_pres_prob', torch.tensor(args.z_pres_anneal_start_value))   # `current value` used for training and annealing
         self.register_buffer('z_what_mean', torch.zeros(args.z_what_size))
         self.register_buffer('z_what_scale', torch.ones(args.z_what_size))
         self.register_buffer('z_where_mean', torch.tensor([0.3, 0., 0.]))
@@ -274,14 +373,15 @@ class AIR(nn.Module):
         #   q_z_what encodes the attention window; q_z_what = Normal(mu, sigma)
         #   q_z_where encodes the affine transform of of the image > attn_window; q_z_where = Normal(0, cov) of dim = 3 for [scale, tx, ty]
         self.encoder = nn.ModuleDict({
-            'rnn':      nn.LSTMCell(x_size + args.z_where_size + args.z_what_size + args.z_pres_size, args.lstm_size),
+            # 'rnn':      nn.LSTMCell(x_size + args.z_where_size + args.z_what_size + args.z_pres_size, args.lstm_size),
+            'rnn': nn.LSTMCell(x_size + args.z_where_size + args.z_what_size, args.lstm_size),
             'z_pres':   nn.Linear(args.lstm_size, 1),
             'z_what':   nn.Sequential(nn.Linear(self.A ** 2 , args.enc_dec_size),
                                       nn.ReLU(True),
                                       nn.Linear(args.enc_dec_size, 2 * args.z_what_size)),
             'z_where':  nn.Linear(args.lstm_size, 2 * args.z_where_size)})
 
-        nn.init.constant_(self.encoder.z_pres.bias, args.z_pres_init_encoder_bias)  # push initial num time steps probs higher
+        # nn.init.constant_(self.encoder.z_pres.bias, args.z_pres_init_encoder_bias)  # push initial num time steps probs higher
 
         # initialize STN to identity
         self.encoder.z_where.weight.data.zero_()
@@ -292,7 +392,8 @@ class AIR(nn.Module):
         # --------------------
 
         self.baseline = nn.ModuleDict({
-            'rnn':       nn.LSTMCell(x_size + args.z_where_size + args.z_what_size + args.z_pres_size, args.baseline_lstm_size),
+            # 'rnn':       nn.LSTMCell(x_size + args.z_where_size + args.z_what_size + args.z_pres_size, args.baseline_lstm_size),
+            'rnn': nn.LSTMCell(x_size + args.z_where_size + args.z_what_size, args.baseline_lstm_size),
             'linear':    nn.Linear(args.baseline_lstm_size, 1)})
 
     @property
@@ -332,17 +433,25 @@ class AIR(nn.Module):
         kl_z_where = torch.zeros(batch_size, device=device)
 
         # initialize canvas, encoder rnn, states of the latent variables, mask for z_pres, baseline rnn
-        recon_x = torch.zeros(batch_size, 3 if box_attn_window_color is not None else self.C, self.H, self.W, device=device)
-        h_enc = torch.zeros(batch_size, self.lstm_size, device=device)
-        c_enc = torch.zeros_like(h_enc)
-        z_pres = torch.ones(batch_size, 1, device=device)
-        z_what = torch.zeros(batch_size, self.z_what_size, device=device)
-        z_where = torch.rand(batch_size, self.z_where_size, device=device)
-        h_baseline = torch.zeros(batch_size, self.baseline_lstm_size, device=device)
-        c_baseline = torch.zeros_like(h_baseline)
+        # recon_x = torch.zeros(batch_size, 3 if box_attn_window_color is not None else self.C, self.H, self.W, device=device)
+        # h_enc = torch.zeros(batch_size, self.lstm_size, device=device)
+        # c_enc = torch.zeros_like(h_enc)
+        # # z_pres = torch.ones(batch_size, 1, device=device)
+        # z_what = torch.zeros(batch_size, self.z_what_size, device=device)
+        # z_where = torch.rand(batch_size, self.z_where_size, device=device)
+        # h_baseline = torch.zeros(batch_size, self.baseline_lstm_size, device=device)
+        # c_baseline = torch.zeros_like(h_baseline)
 
         # run model forward up to a max number of reconstruction steps
         for i in range(self.max_steps):
+
+            h_enc = torch.zeros(batch_size, self.lstm_size, device=device)
+            c_enc = torch.zeros_like(h_enc)
+            # z_pres = torch.ones(batch_size, 1, device=device)
+            z_what = torch.zeros(batch_size, self.z_what_size, device=device)
+            z_where = torch.rand(batch_size, self.z_where_size, device=device)
+            h_baseline = torch.zeros(batch_size, self.baseline_lstm_size, device=device)
+            c_baseline = torch.zeros_like(h_baseline)
 
             # --------------------
             # Inference step -- AIR paper fig3 middle.
@@ -352,11 +461,12 @@ class AIR(nn.Module):
             # --------------------
 
             # rnn encoder
-            h_enc, c_enc = self.encoder.rnn(torch.cat([x, z_pres, z_what, z_where], dim=-1), (h_enc, c_enc))
+            # h_enc, c_enc = self.encoder.rnn(torch.cat([x, z_pres, z_what, z_where], dim=-1), (h_enc, c_enc))
+            h_enc, c_enc = self.encoder.rnn(torch.cat([x, z_what, z_where], dim=-1), (h_enc, c_enc))
 
             # 1. compute 1-dimensional Bernoulli variable indicating the entity’s presence; note: if z_pres == 0, subsequent mask are zeroed
-            q_z_pres = D.Bernoulli(probs = torch.clamp(z_pres * torch.sigmoid(self.encoder.z_pres(h_enc)), 1e-5, 1 - 1e-5))  # avoid probs that are exactly 0 or 1
-            z_pres = q_z_pres.sample()
+            # q_z_pres = D.Bernoulli(probs = torch.clamp(z_pres * torch.sigmoid(self.encoder.z_pres(h_enc)), 1e-5, 1 - 1e-5))  # avoid probs that are exactly 0 or 1
+            # z_pres = q_z_pres.sample()
 
             # 2. compute 3-dimensional vector specifying the affine parameters of its position and scale (ziwhere).
             q_z_where_mean, q_z_where_scale = self.encoder.z_where(h_enc).chunk(2, -1)
@@ -384,14 +494,16 @@ class AIR(nn.Module):
             y = stn(y_att, z_where, (batch_size, self.C, self.H, self.W), inverse=True, box_attn_window_color=i if box_attn_window_color is not None else None)
 
             # 2. add reconstruction to canvas
-            recon_x += y * z_pres.view(-1,1,1,1)
+            # recon_x += y * z_pres.view(-1,1,1,1)
+            recon_x = y
 
             # --------------------
             # Baseline step -- AIR paper cf's Mnih & Gregor NVIL; specifically sec 2.3 variance reduction
             # --------------------
 
             # compute baseline; independent of the z latents (cf Mnih & Gregor NVIL) so detach from graph
-            baseline_input = torch.cat([x, z_pres.detach(), z_what.detach(), z_where.detach()], dim=-1)
+            # baseline_input = torch.cat([x, z_pres.detach(), z_what.detach(), z_where.detach()], dim=-1)
+            baseline_input = torch.cat([x, z_what.detach(), z_where.detach()], dim=-1)
             h_baseline, c_baseline = self.baseline.rnn(baseline_input, (h_baseline, c_baseline))
             baseline += self.baseline.linear(h_baseline).squeeze()  # note: masking by z_pres give poorer results
 
@@ -400,15 +512,15 @@ class AIR(nn.Module):
             # --------------------
 
             # compute kl(q||p) divergences -- sum over latent dim
-            kl_z_what += D.kl.kl_divergence(q_z_what, self.p_z_what).sum(1) * z_pres.squeeze()
-            kl_z_where += D.kl.kl_divergence(q_z_where, self.p_z_where).sum(1) * z_pres.squeeze()
+            # kl_z_what += D.kl.kl_divergence(q_z_what, self.p_z_what).sum(1) * z_pres.squeeze()
+            # kl_z_where += D.kl.kl_divergence(q_z_where, self.p_z_where).sum(1) * z_pres.squeeze()
 
-            pred_counts[:,i] = z_pres.flatten()
-            obj_probs[:,i] = q_z_pres.probs.flatten()
+            # pred_counts[:,i] = z_pres.flatten()
+            # obj_probs[:,i] = q_z_pres.probs.flatten()
 
-        q_z_pres = compute_geometric_from_bernoulli(obj_probs)
-        score_fn = q_z_pres[torch.arange(batch_size), pred_counts.sum(1).long()].log()  # log prob of num objects under the geometric
-        kl_z_pres = compute_z_pres_kl(q_z_pres, self.p_z_pres, writer).sum(1)  # note: mask by pred_counts makes no difference
+        # q_z_pres = compute_geometric_from_bernoulli(obj_probs)
+        # score_fn = q_z_pres[torch.arange(batch_size), pred_counts.sum(1).long()].log()  # log prob of num objects under the geometric
+        # kl_z_pres = compute_z_pres_kl(q_z_pres, self.p_z_pres, writer).sum(1)  # note: mask by pred_counts makes no difference
 
         p_x_z = D.Normal(recon_x.flatten(1), self.likelihood_sigma)
         log_like = p_x_z.log_prob(x.view(-1, self.C, self.H, self.W).expand_as(recon_x).flatten(1)).sum(-1) # sum image dims (C, H, W)
@@ -417,8 +529,10 @@ class AIR(nn.Module):
         # Compute variational bound and loss function
         # --------------------
 
-        elbo = log_like - kl_z_pres - kl_z_what - kl_z_where              # objective for loss function, but high variance
-        loss = - torch.sum(elbo + (elbo - baseline).detach() * score_fn)  # var reduction surrogate objective objective (cf Mnih & Gregor NVIL)
+        # elbo = log_like - kl_z_pres - kl_z_what - kl_z_where              # objective for loss function, but high variance
+        elbo = log_like
+        # loss = - torch.sum(elbo + (elbo - baseline).detach() * score_fn)  # var reduction surrogate objective objective (cf Mnih & Gregor NVIL)
+        loss = - torch.sum(elbo + (elbo - baseline).detach())
         baseline_loss = F.mse_loss(elbo.detach(), baseline)
 
         if writer:
@@ -428,8 +542,8 @@ class AIR(nn.Module):
             writer.add_scalar('kl_z_where',   kl_z_where.mean(0).item(), writer.step)
             writer.add_scalar('elbo',               elbo.mean(0).item(), writer.step)
             writer.add_scalar('baseline',       baseline.mean(0).item(), writer.step)
-            writer.add_scalar('score_function', score_fn.mean(0).item(), writer.step)
-            writer.add_scalar('z_pres_prob',    self.z_pres_prob.item(), writer.step)
+            # writer.add_scalar('score_function', score_fn.mean(0).item(), writer.step)
+            # writer.add_scalar('z_pres_prob',    self.z_pres_prob.item(), writer.step)
 
         return recon_x, pred_counts, elbo, loss, baseline_loss
 
@@ -444,7 +558,7 @@ class AIR(nn.Module):
         The learnable parameters θ of the generative model are the parameters of this decoder network.
         """
         # sample z_pres ~ Geom(rho) -- this is the number of digits present in an image
-        z_pres = D.Geometric(1 - self.z_pres_prior).sample((n_samples,)).clamp_(0, self.max_steps)
+        # z_pres = D.Geometric(1 - self.z_pres_prior).sample((n_samples,)).clamp_(0, self.max_steps)
 
         # compute a mask on z_pres as e.g.:
         #   z_pres = [1,4,2,0]
@@ -454,24 +568,26 @@ class AIR(nn.Module):
         #           [0,0,0,0,0]]
         #   thus network outputs more objects (sample z_what, z_where and decode) where z_pres is 1
         #   and outputs nothing when z_pres is 0
-        z_pres_mask = torch.arange(self.max_steps).float().to(z_pres.device).expand(n_samples, self.max_steps) < z_pres.view(-1,1)
-        z_pres_mask = z_pres_mask.float().to(z_pres.device)
+        # z_pres_mask = torch.arange(self.max_steps).float().to(z_pres.device).expand(n_samples, self.max_steps) < z_pres.view(-1,1)
+        # z_pres_mask = z_pres_mask.float().to(z_pres.device)
 
         # initialize image canvas
-        x = torch.zeros(n_samples, self.C, self.H, self.W).to(z_pres.device)
+        # x = torch.zeros(n_samples, self.C, self.H, self.W).to(z_pres.device)
 
         # generate digits
-        for i in range(int(z_pres.max().item())):  # up until the number of objects sampled via z_pres
+        # for i in range(int(z_pres.max().item())):  # up until the number of objects sampled via z_pres
             # sample priors
-            z_what = self.p_z_what.sample((n_samples,))
-            z_where = self.p_z_where.sample((n_samples,))
+        z_what = self.p_z_what.sample((n_samples,))
+        z_where = self.p_z_where.sample((n_samples,))
 
-            # propagate through the decoder, scale and shift y_att according to z_where using spatial transformers
-            y_att = torch.sigmoid(self.decoder(z_what).view(n_samples, self.C, self.A, self.A) + self.decoder_bias)
-            y = stn(y_att, z_where, (n_samples, self.C, self.H, self.W), inverse=True, box_attn_window_color=i)
+        # propagate through the decoder, scale and shift y_att according to z_where using spatial transformers
+        y_att = torch.sigmoid(self.decoder(z_what).view(n_samples, self.C, self.A, self.A) + self.decoder_bias)
+        # y = stn(y_att, z_where, (n_samples, self.C, self.H, self.W), inverse=True, box_attn_window_color=i)
+        y = stn(y_att, z_where, (n_samples, self.C, self.H, self.W), inverse=True, box_attn_window_color=0)
 
-            # apply mask and sum results towards final image
-            x = x + y * z_pres_mask[:,i].view(-1,1,1,1)
+        # apply mask and sum results towards final image
+        # x = x + y * z_pres_mask[:,i].view(-1,1,1,1)
+        x = y
         return x
 
 
@@ -485,6 +601,7 @@ def train_epoch(model, dataloader, model_optimizer, baseline_optimizer, anneal_z
     with tqdm(total=len(dataloader), desc='epoch {} / {}'.format(epoch+1, args.start_epoch + args.n_epochs)) as pbar:
 
         for i, (x, y) in enumerate(dataloader):
+            y = torch.tensor(utils_nn.idx_to_multi_hot(y, loc_num, dig_to_use=the_dig_to_use, loc_sensitive=False))
             writer.step += 1  # update global step
 
             x = x.view(x.shape[0], -1).to(args.device)
@@ -493,7 +610,7 @@ def train_epoch(model, dataloader, model_optimizer, baseline_optimizer, anneal_z
             recon_x, pred_counts, elbo, loss, baseline_loss = model(x, writer if i % args.log_interval == 0 else None)  # pass writer at logging intervals
 
             # anneal z_pres prior
-            model.z_pres_prob = anneal_z_pres_prob(model.z_pres_prob, writer.step, args)
+            # model.z_pres_prob = anneal_z_pres_prob(model.z_pres_prob, writer.step, args)
 
             model_optimizer.zero_grad()
             loss.backward()
@@ -504,7 +621,7 @@ def train_epoch(model, dataloader, model_optimizer, baseline_optimizer, anneal_z
             baseline_optimizer.step()
 
             # update tracking
-            count_accuracy = torch.eq(pred_counts.sum(1).cpu(), y.sum(1)).float().mean()
+            count_accuracy = torch.eq(pred_counts.sum(1).cpu(), y.cpu().sum(1)).float().mean()
             pbar.set_postfix(elbo='{:.3f}'.format(elbo.mean(0).item()), \
                              loss='{:.3f}'.format(loss.item()), \
                              count_acc='{:.2f}'.format(count_accuracy.item()))
@@ -540,7 +657,7 @@ def evaluate(model, dataloader, args, n_samples=10):
 
     # evaluate count accuracy; test dataset not shuffled to preds and true aligned sequentially
     pred_counts = torch.cat(pred_counts, dim=0)
-    true_counts = torch.cat(true_counts, dim=0)
+    true_counts = torch.cat(true_counts, dim=0).float()
     count_accuracy = torch.eq(pred_counts.sum(1), true_counts.sum(1)).float().mean()
 
     # visualize reconstruction
@@ -586,7 +703,8 @@ def train_and_evaluate(model, train_dataloader, test_dataloader, model_optimizer
 if __name__ == '__main__':
     args = parser.parse_args()
 
-    # args.max_steps = 1
+    args.max_steps = 1
+    args.eval_interval = 5
 
     # setup writer and output folders
     writer = SummaryWriter(log_dir = os.path.join(args.output_dir, time.strftime('%Y-%m-%d_%H-%M-%S', time.gmtime())) \
